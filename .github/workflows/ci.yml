@@ -18,3 +18,4 @@ jobs:
       pull-requests: write
       actions: write
     secrets: inherit
+# a comment (scenario: a member changing a workflow)
