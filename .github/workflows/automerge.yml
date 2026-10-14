@@ -8,7 +8,7 @@ jobs:
   merge:
     uses: ./.github/workflows/shared-automerge.yml
     with:
-      batch: true
+      batch: false
     permissions:
       contents: write
       pull-requests: write
