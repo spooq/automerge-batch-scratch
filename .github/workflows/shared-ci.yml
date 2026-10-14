@@ -1,0 +1,417 @@
+# Reusable: a repository's CI on a pull request, on the tree its merge will produce, which the shared automerge
+# (automerge.yml) waits for. Ported from spooq/lusine's automerge (#161, #185), whose gate and compile jobs it runs.
+#
+#   gates     the pull request's head with the default branch merged in (its sha as MAIN_SHA), Python set up and the
+#             pinned packages installed, then `gate-command` (a repository's `python tools/gates.py ci --diff-base
+#             "$MAIN_SHA"`). On a dispatch (the automerge's, after bringing a branch up to date) the branch as it is.
+#             Each job names the default branch it merged in by an artifact, tested-main-<job>-<sha>. The compile job
+#             sets KEPT_BUILD, a build directory kept between runs beside the checkout, for its compile-command.
+#   compile   the same tree, then `compile-command`, when one is given and there is a CMakeLists.txt; with `vcpkg`,
+#             vcpkg is cloned and bootstrapped once into the runner's home and its binary cache kept beside it. With
+#             `compile-paths`, only where the pull request changes a file one of its globs matches: otherwise the job
+#             passes having compiled nothing, which the automerge takes as passed.
+#   conflict  on pull_request_target, since GitHub starts no pull_request run for a branch with a conflict: once the
+#             branch is CONFLICTING, one comment naming the conflicting files (git merge-tree on the fetched commits;
+#             nothing of the branch is checked out or run).
+#
+# Each job says on the pull request why it failed. A draft and a fork's pull request are skipped. A repository's
+# workflow named CI calls this with its triggers (callers/ci.yml) and `secrets: inherit`. Submodules are checked out
+# recursively (a game's lusine, and the trait inside it), through LUSINE_TOKEN: a token with read on every private
+# repository the tree pins, spooq/lusine and spooq/trait among them.
+name: ci
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: the jobs' runs-on, as JSON
+        type: string
+        default: '"ubuntu-latest"'
+      gate-command:
+        description: run on the merged tree, with MAIN_SHA set; empty for none
+        type: string
+        default: ''
+      compile-command:
+        description: run on the merged tree, with MAIN_SHA set, where there is a CMakeLists.txt; empty for no compile job
+        type: string
+        default: ''
+      compile-paths:
+        description: >-
+          the files the compile can be affected by, as globs separated by whitespace, each matched to a changed path as
+          bash matches a pattern (* crosses /, so src/* and src/** both name everything under src); where the pull
+          request merged with the default branch changes none, nothing is compiled and the job passes. Empty for always
+        type: string
+        default: ''
+      vcpkg:
+        description: the compile job's vcpkg, once per runner (VCPKG_ROOT and its binary cache in the runner's home)
+        type: boolean
+        default: false
+      python-requirements:
+        description: the pinned packages installed before the gates; the first of these files that exists
+        type: string
+        default: requirements.txt lusine/requirements.txt
+      automerge-workflow:
+        description: >-
+          the automerge workflow file, dispatched when a run the automerge dispatched on a pull request's branch passes
+          (a run a workflow's token starts brings no workflow_run back, so it is woken this way); empty for none
+        type: string
+        default: automerge.yml
+      light-runner:
+        description: >-
+          the conflict and wake jobs' runs-on, as JSON: seconds of gh calls that need no build, which otherwise queue
+          behind the gates and compiles for the same runners, a passing run's wake (its merge) waiting with them; a
+          runner kept for short jobs (lusine's publish runner, labelled light). Empty for `runner`
+        type: string
+        default: ''
+      browser:
+        description: >-
+          a self-hosted runner must name its browser in CHROMIUM (its .env), checked before the gates: lusine's gates
+          skip their web rows, silently, where there is none (seven of the box's runners ran without them until
+          2026-10-14); false for a repository whose gates have no web rows
+        type: boolean
+        default: true
+      gates-timeout-minutes:
+        description: >-
+          the gates job's limit, so a hung run frees the runner instead of holding it for GitHub's default of 360
+          minutes; a repository whose gates run longer raises it
+        type: number
+        default: 240
+    secrets:
+      LUSINE_TOKEN:
+        description: read on spooq/lusine, for a private lusine submodule
+        required: false
+
+jobs:
+  conflict:
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.state == 'open'
+    runs-on: ${{ fromJSON(inputs.light-runner != '' && inputs.light-runner || inputs.runner) }}
+    timeout-minutes: 10   # a poll of at most two minutes and one comment
+    defaults:
+      run:
+        shell: bash   # bash wherever it runs (a Windows runner's default is PowerShell; Git Bash there)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      BASE: ${{ github.event.pull_request.base.ref }}
+    steps:
+      - name: Say so, once, when this branch does not merge with the base
+        run: |
+          set -uo pipefail
+          state=UNKNOWN                         # GitHub computes mergeability after the push
+          for i in $(seq 1 20); do
+            state=$(gh pr view "$PR" --json mergeable -q .mergeable)
+            [ "$state" != UNKNOWN ] && break
+            sleep 6
+          done
+          echo "mergeable: $state"
+          [ "$state" = CONFLICTING ] || exit 0
+          marker="<!-- automerge:conflict -->"
+          if gh pr view "$PR" --json comments -q '.comments[].body' | grep -qF "$marker"; then exit 0; fi
+          work=$(mktemp -d); git -C "$work" init -q; files=""
+          if git -C "$work" fetch -q --no-tags "https://x-access-token:${GH_TOKEN}@github.com/${GH_REPO}.git" \
+              "+refs/heads/$BASE:refs/ci/base" "+refs/pull/$PR/head:refs/ci/head"; then
+            files=$(git -C "$work" merge-tree --write-tree --name-only --no-messages refs/ci/base refs/ci/head | tail -n +2 || true)
+          fi
+          rm -rf "$work"
+          list=$(printf '%s\n' "$files" | sed '/^$/d' | sed 's/^/- `/; s/$/`/')
+          gh pr comment "$PR" --body "**Not merged: this branch does not merge cleanly with \`$BASE\`**, so no gate has run on it. ${list:+The conflicting files:
+          $list
+          }Merge \`origin/$BASE\` into the branch or rebase onto it, resolve, and push.
+
+          $marker"
+
+  gates:
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request' && github.event.pull_request.draft == false
+          && github.event.pull_request.head.repo.full_name == github.repository)
+    concurrency:
+      group: gates-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.gates-timeout-minutes }}
+    defaults:
+      run:
+        shell: bash   # bash wherever it runs (a Windows runner's default is PowerShell; Git Bash there)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      DEFAULT: ${{ github.event.repository.default_branch }}
+      RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Stop if the pull request is no longer open
+        id: open
+        # a run that waited in the queue past its pull request's merge would merge the branch into a main that already
+        # has it, conflict, and say "Not merged" on a merged pull request
+        run: |
+          state=OPEN
+          [ "${{ github.event_name }}" = pull_request ] && state=$(gh pr view "$PR" --json state -q .state || echo OPEN)
+          if [ "$state" = MERGED ] || [ "$state" = CLOSED ]; then
+            echo "pull request #$PR is $state: nothing to check"; echo "open=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "open=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Check out the head
+        if: steps.open.outputs.open == 'yes'
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.LUSINE_TOKEN || github.token }}
+      - name: Merge the default branch in, as the merge will
+        if: steps.open.outputs.open == 'yes'
+        id: mergemain
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force origin "$DEFAULT"
+          main=$(git rev-parse FETCH_HEAD)
+          echo "MAIN_SHA=$main" >> "$GITHUB_ENV"
+          git -c user.name=ci -c user.email=ci@invalid merge --no-ff --no-edit "$main"
+          git submodule update --init --recursive
+      # the default branch this run merged in and tested, as an artifact's name: the automerge merges only where every
+      # job of the passing run tested the default branch as it still is
+      - name: Record the default branch tested
+        if: steps.open.outputs.open == 'yes'
+        run: echo "$MAIN_SHA" > "$RUNNER_TEMP/tested-main.txt"
+      - uses: actions/upload-artifact@v4
+        if: steps.open.outputs.open == 'yes'
+        with:
+          name: tested-main-gates-${{ env.MAIN_SHA }}
+          path: ${{ runner.temp }}/tested-main.txt
+          retention-days: 3
+      # not on Windows: setup-python's installer is a PowerShell script the box's execution policy refuses, and the
+      # Windows runners' PATH (their .env) carries Python already
+      - uses: actions/setup-python@v5
+        if: steps.open.outputs.open == 'yes' && runner.os != 'Windows'
+        with:
+          python-version: '3.x'
+      # a Windows runner's own Python environment, a venv beside it (its _work's parent): the box's runners share one
+      # system Python, and two jobs installing into its site-packages at once collide (WinError 2, 2026-10-09); one
+      # runner runs one job at a time, so its venv is its own. Pins already met install nothing.
+      - name: The runner's venv
+        if: steps.open.outputs.open == 'yes' && runner.os == 'Windows'
+        run: |
+          v="$(cygpath -m "$RUNNER_WORKSPACE/../..")/venv-ci"
+          [ -x "$v/Scripts/python.exe" ] || python -m venv "$v"
+          echo "$(cygpath -u "$v")/Scripts" >> "$GITHUB_PATH"
+      - name: Install the pinned packages
+        if: steps.open.outputs.open == 'yes'
+        env:
+          REQ: ${{ inputs.python-requirements }}
+        run: |
+          for f in $REQ; do
+            if [ -f "$f" ]; then python -m pip install --quiet --disable-pip-version-check -r "$f"; break; fi
+          done
+      - name: The runner's browser (CHROMIUM)
+        id: browser
+        if: steps.open.outputs.open == 'yes' && inputs.gate-command != '' && inputs.browser && runner.environment == 'self-hosted'
+        run: |
+          if [ -z "${CHROMIUM:-}" ] || [ ! -f "$CHROMIUM" ]; then
+            echo "::error::runner $RUNNER_NAME names no browser: CHROMIUM is '${CHROMIUM:-}' (set it in the runner's .env to msedge.exe or chrome.exe, and restart the runner); without it the gates' web rows are skipped"
+            exit 1
+          fi
+          echo "browser: $CHROMIUM"
+      - name: Run the gates
+        id: gates
+        if: steps.open.outputs.open == 'yes' && (inputs.gate-command != '')
+        run: ${{ inputs.gate-command }}
+      - name: Say why the merge did not happen
+        if: failure() && github.event_name == 'pull_request'
+        run: |
+          [ "$(gh pr view "$PR" --json state -q .state)" = OPEN ] || exit 0   # merged or closed meanwhile
+          if [ "${{ steps.checkout.outcome }}" = failure ]; then
+            body="**Not merged: the checkout failed** before any gate ran (a private lusine submodule needs the \`LUSINE_TOKEN\` secret). See [this run]($RUN)."
+          elif [ "${{ steps.browser.outcome }}" = failure ]; then
+            body="**Not merged: the runner names no browser** (\`CHROMIUM\` in its \`.env\`), so the gates' web rows would be skipped; this is the runner's to fix, not the branch's. See [this run]($RUN)."
+          elif [ "${{ steps.mergemain.outcome }}" = failure ]; then
+            body="**Not merged: this branch does not merge cleanly with \`$DEFAULT\`.** Rebase onto it and push."
+          elif [ "${{ steps.gates.outcome }}" = failure ]; then
+            body="**Not merged: a gate failed** on this branch merged with current \`$DEFAULT\`. See [this run]($RUN)."
+          else
+            body="**Not merged: a step before the gates failed**; the gates did not run. See [this run]($RUN)."
+          fi
+          gh pr comment "$PR" --body "$body" || true
+
+  compile:
+    if: >-
+      inputs.compile-command != '' &&
+      (github.event_name == 'workflow_dispatch'
+       || (github.event_name == 'pull_request' && github.event.pull_request.draft == false
+           && github.event.pull_request.head.repo.full_name == github.repository))
+    concurrency:
+      group: compile-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    defaults:
+      run:
+        shell: bash   # bash wherever it runs (a Windows runner's default is PowerShell; Git Bash there)
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      DEFAULT: ${{ github.event.repository.default_branch }}
+      RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Stop if the pull request is no longer open
+        id: open
+        # a run that waited in the queue past its pull request's merge would merge the branch into a main that already
+        # has it, conflict, and say "Not merged" on a merged pull request
+        run: |
+          state=OPEN
+          [ "${{ github.event_name }}" = pull_request ] && state=$(gh pr view "$PR" --json state -q .state || echo OPEN)
+          if [ "$state" = MERGED ] || [ "$state" = CLOSED ]; then
+            echo "pull request #$PR is $state: nothing to check"; echo "open=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "open=yes" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.open.outputs.open == 'yes'
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.LUSINE_TOKEN || github.token }}
+      - name: Merge the default branch in, as the merge will
+        if: steps.open.outputs.open == 'yes'
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --force origin "$DEFAULT"
+          main=$(git rev-parse FETCH_HEAD)
+          echo "MAIN_SHA=$main" >> "$GITHUB_ENV"
+          git -c user.name=ci -c user.email=ci@invalid merge --no-ff --no-edit "$main"
+          git submodule update --init --recursive
+      # the default branch this run merged in and tested, as an artifact's name: the automerge merges only where every
+      # job of the passing run tested the default branch as it still is
+      - name: Record the default branch tested
+        if: steps.open.outputs.open == 'yes'
+        run: echo "$MAIN_SHA" > "$RUNNER_TEMP/tested-main.txt"
+      - uses: actions/upload-artifact@v4
+        if: steps.open.outputs.open == 'yes'
+        with:
+          name: tested-main-compile-${{ env.MAIN_SHA }}
+          path: ${{ runner.temp }}/tested-main.txt
+          retention-days: 3
+      # COMPILE-PATHS: the files the merge changes on the default branch (the diff from MAIN_SHA to the merged tree, a
+      # rename as its two paths, a submodule whose pin moves as its path), each held to the globs. Where none matches,
+      # the compile is skipped and the job passes: every file it reads is the default branch's, compiled when it merged.
+      # A dispatch on the default branch itself, and an empty `compile-paths`, always compile.
+      - name: Find what there is to compile
+        if: steps.open.outputs.open == 'yes'
+        id: what
+        env:
+          PATHS: ${{ inputs.compile-paths }}
+        run: |
+          set -euo pipefail
+          if [ ! -f CMakeLists.txt ]; then
+            echo "cxx=no" >> "$GITHUB_OUTPUT"; echo "no CMakeLists.txt: nothing to compile"; exit 0
+          fi
+          if [ -z "${PATHS//[[:space:]]/}" ] || { [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF_NAME" = "$DEFAULT" ]; }; then
+            echo "cxx=yes" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          set -f   # the globs are patterns, never expanded against the checkout
+          # written first, so a diff that fails stops the job rather than reading as a change that touches nothing
+          changed="$RUNNER_TEMP/changed-paths"
+          git -c core.quotepath=off diff --name-only --no-renames -z "${MAIN_SHA:?}" HEAD > "$changed"
+          hit=""
+          while IFS= read -r -d '' f; do
+            for pat in $PATHS; do
+              if [[ "$f" == $pat ]]; then hit="$f (compile-paths: $pat)"; break 2; fi
+            done
+          done < "$changed"
+          if [ -n "$hit" ]; then
+            echo "the change reaches the compile: $hit"; echo "cxx=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "nothing this change touches is in compile-paths: the compile is not run, and passes"
+            tr '\0' '\n' < "$changed" | sed 's/^/  /'
+            echo "cxx=no" >> "$GITHUB_OUTPUT"
+            echo "Compile skipped: the change touches nothing in \`compile-paths\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      # not on Windows: setup-python's installer is a PowerShell script the box's execution policy refuses, and the
+      # Windows runners' PATH (their .env) carries Python already
+      - uses: actions/setup-python@v5
+        if: steps.what.outputs.cxx == 'yes' && runner.os != 'Windows'
+        with:
+          python-version: '3.x'
+      # a Windows runner's own Python environment, a venv beside it (its _work's parent): the box's runners share one
+      # system Python, and two jobs installing into its site-packages at once collide (WinError 2, 2026-10-09); one
+      # runner runs one job at a time, so its venv is its own. Pins already met install nothing.
+      - name: The runner's venv
+        if: steps.what.outputs.cxx == 'yes' && runner.os == 'Windows'
+        run: |
+          v="$(cygpath -m "$RUNNER_WORKSPACE/../..")/venv-ci"
+          [ -x "$v/Scripts/python.exe" ] || python -m venv "$v"
+          echo "$(cygpath -u "$v")/Scripts" >> "$GITHUB_PATH"
+      - name: Install the pinned packages
+        if: steps.what.outputs.cxx == 'yes' && runner.os == 'Windows'
+        env:
+          REQ: ${{ inputs.python-requirements }}
+        run: |
+          for f in $REQ; do
+            if [ -f "$f" ]; then python -m pip install --quiet --disable-pip-version-check -r "$f"; break; fi
+          done
+      - name: vcpkg, once per runner
+        if: steps.what.outputs.cxx == 'yes' && inputs.vcpkg
+        run: |
+          set -euo pipefail
+          root="$HOME/vcpkg"; cache="$HOME/vcpkg-archives"; exe=vcpkg; boot=bootstrap-vcpkg.sh
+          if [ "$RUNNER_OS" = Windows ]; then
+            # the box's Windows runners share one user's home: a vcpkg each, beside the runner (its _work's parent),
+            # so two runners never fetch into one; the binary cache stays shared, Windows paths for CMake
+            root="$(cygpath -m "$RUNNER_WORKSPACE/../..")/vcpkg"; cache="$(cygpath -m "$HOME")/vcpkg-archives"
+            exe=vcpkg.exe; boot=bootstrap-vcpkg.bat
+          fi
+          { echo "VCPKG_ROOT=$root"; echo "VCPKG_DEFAULT_BINARY_CACHE=$cache"; echo "VCPKG_DISABLE_METRICS=1"; } >> "$GITHUB_ENV"
+          mkdir -p "$cache"
+          if [ ! -x "$root/$exe" ]; then
+            rm -rf "$root"
+            git clone --quiet https://github.com/microsoft/vcpkg.git "$root"
+            if [ "$RUNNER_OS" = Windows ]; then cmd //c "$(cygpath -w "$root/$boot")" -disableMetrics; else "$root/$boot" -disableMetrics; fi
+          else
+            git -C "$root" fetch --quiet origin && git -C "$root" checkout --quiet FETCH_HEAD
+          fi
+      # KEPT_BUILD: a build directory beside the runner's checkout, not in it (the checkout's clean would remove it), so
+      # a compile-command that builds there rebuilds only what the change reaches; one runner runs one job at a time
+      - name: The kept build directory
+        if: steps.what.outputs.cxx == 'yes'
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then w=$(cygpath -m "$RUNNER_WORKSPACE"); else w="$RUNNER_WORKSPACE"; fi
+          echo "KEPT_BUILD=$w/kept-build" >> "$GITHUB_ENV"
+      - name: Compile
+        id: compile
+        if: steps.what.outputs.cxx == 'yes'
+        run: ${{ inputs.compile-command }}
+      - name: Say why the merge did not happen
+        if: failure() && github.event_name == 'pull_request'
+        run: |
+          [ "$(gh pr view "$PR" --json state -q .state)" = OPEN ] || exit 0   # merged or closed meanwhile
+          gh pr comment "$PR" --body "**Not merged: the compile failed** (the build, its suites, or the gate rows needing it) on this branch merged with current \`$DEFAULT\`. See [this run]($RUN)." || true
+
+  # A CI run the automerge dispatched on a pull request's branch (the default branch having moved since the last run)
+  # brings no workflow_run back, since a workflow's token started it; a workflow_dispatch is the one event that token
+  # may start, so the passing run dispatches the automerge, which merges it at once instead of at the next sweep. On an
+  # automerge batch branch (automerge/batch-*, the automerge's `batch`; 2026-10-14) a failing run wakes it too: it
+  # splits the batch in halves and runs CI on each, and a repository with no scheduled sweep (lusine) would otherwise
+  # leave the batch's pull requests waiting on nothing.
+  wake:
+    needs: [gates, compile]
+    if: >-
+      always() && inputs.automerge-workflow != '' && github.event_name == 'workflow_dispatch' &&
+      github.ref_name != github.event.repository.default_branch &&
+      ((needs.gates.result == 'success' && (needs.compile.result == 'success' || needs.compile.result == 'skipped'))
+       || startsWith(github.ref_name, 'automerge/batch-'))
+    runs-on: ${{ fromJSON(inputs.light-runner != '' && inputs.light-runner || inputs.runner) }}
+    continue-on-error: true   # a caller that grants no actions: write is left to the sweep
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Wake the automerge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run "${{ inputs.automerge-workflow }}" --repo "${{ github.repository }}" --ref "${{ github.event.repository.default_branch }}"

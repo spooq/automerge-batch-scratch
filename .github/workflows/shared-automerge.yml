@@ -1,0 +1,501 @@
+# Reusable: a pull request merges itself once CI passes on it. A draft, or a pull request labelled with the hold label,
+# waits. The merge is a squash by the caller's token of the tree CI passed on (the default branch it tested is still
+# the default branch), so no CI runs on main after it unless `ci-after-merge` asks. After the merge it closes each issue a closing keyword in the
+# body names (`Closes #N`, `Fixes #N`, `Resolves #N` and their tenses) that is still open: GitHub closes them itself
+# on a merge to the default branch, and this is the fallback when it does not. A pull request that does part of an
+# issue says `see #N`, which closes nothing. Before the merge, a closing keyword the body or a commit puts inside a
+# negation or a quote ("does not close #N", which GitHub closes all the same) refuses the merge, with the phrase quoted
+# on the pull request (scripts/closing_keywords.py, pasted below by scripts/embed.py: a caller cannot read this
+# repository's files).
+#
+# A repository calls it from a workflow triggered by its CI's completion (callers/automerge.yml): a reusable workflow
+# cannot listen for workflow_run itself, and the github context it sees is the caller's event. CI completing on a
+# pull request, or on a branch this workflow dispatched it on after bringing the branch up to date, is a candidate;
+# CI on the default branch is not. The caller's job grants
+# the permissions: contents, pull-requests, actions and issues, all write.
+#
+# THE SWEEP. A run started by a workflow's own token starts no workflow_run, so the CI this workflow dispatches on a
+# branch it brought up to date never brings it back (spooq/trait#393 waited for a hand, 2026-10-07). The caller also
+# runs it on a schedule (and by hand): then every open pull request whose head has a successful CI run is taken as if
+# that run had just completed, and merged, brought up to date, or left, by the same rules. A head with a CI run still
+# queued or running is left to it. Waiting for CI inside this job instead would deadlock where one self-hosted runner
+# serves both.
+#
+# BATCHES (`batch: true`; the user, 2026-10-14, "we are dying here with this queue"). With up-to-date on, a green
+# pull request merges only on CI against the default branch as it is, so each merge sends every other green one round
+# CI again, one after another: five green pull requests on lusine's three runners, a CI round about two hours, took six
+# to nine. With `batch`, the green pull requests whose CI ran against an older default branch (two or more; one goes
+# round alone as before) are merged together on a branch, automerge/batch-<main>: the default branch with each head
+# merged in, oldest pull request first (one that does not merge there is left out, and goes round alone). CI is
+# dispatched on it, one round for them all, and its run wakes this workflow, passing or failing (ci.yml's wake). The
+# batch's record is its tip, an empty commit whose message names the default branch it was formed on, each member's
+# head, and the tree CI is to pass (Automerge-Batch-Base, -Member, -Tree): nothing else to keep in step.
+#   passed  where the default branch is still the batch's base, and every member is still open at its recorded head,
+#           neither a draft nor held, its closing keywords allowed: each is squash-merged in order by the single path's
+#           own merge (its own squash commit and title, the issues it closes, retract-label), and the default branch's
+#           tree after the last must be the batch's tree CI passed, or the job fails loudly and says so on each
+#           member. Anything else moved: the batch is abandoned (its branch deleted) and its members formed again.
+#   failed  it is split in halves, each a batch of its own on the default branch as it then is, and so on down; a batch
+#           of one that fails says "Not merged: a gate failed" on its pull request, which waits for a new push.
+#   other   (cancelled, CI never ran) abandoned, and its members formed again.
+# A pull request in a live batch is left to it. The job runs one at a time per repository (its concurrency group),
+# so two wakes never form two batches; prune-branches deletes a batch branch a day stale that nothing settled.
+name: automerge
+
+on:
+  workflow_call:
+    inputs:
+      hold-label:
+        description: a pull request with this label waits
+        type: string
+        default: hold
+      ci-workflow:
+        description: >-
+          the CI workflow file: dispatched on the default branch after a merge, and on a pull request's branch after
+          it is brought up to date; empty for none, which turns up-to-date off
+        type: string
+        default: ci.yml
+      runner:
+        description: the job's runs-on, as JSON (a label, or a list of them for a self-hosted runner)
+        type: string
+        default: '"ubuntu-latest"'
+      merge-method:
+        description: squash, merge or rebase
+        type: string
+        default: squash
+      up-to-date:
+        description: >-
+          merge only what CI passed on: where the default branch has moved since the passing run merged it in (its
+          tested-main-* artifacts, spooq/workflows' ci.yml), CI is dispatched on the branch again, which merges the
+          default branch in as it then is, and the merge waits for that run (no commit is pushed to the branch)
+        type: boolean
+        default: true
+      ci-after-merge:
+        description: >-
+          dispatch CI on the default branch after a merge; off by default, since what merged is the tree CI passed on
+        type: boolean
+        default: false
+      retract-label:
+        description: a label removed from every issue the merge closes, since a close made by this token starts no workflow
+        type: string
+        default: ''
+      batch:
+        description: >-
+          the green pull requests CI ran against an older default branch are merged together on a branch and CI run
+          once on it, then each squash-merged in order where it passes, the batch split in halves where it fails
+          (BATCHES above); needs up-to-date and a ci-workflow whose wake dispatches this one (spooq/workflows' ci.yml)
+        type: boolean
+        default: false
+
+jobs:
+  merge:
+    if: >-
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      ((github.event.workflow_run.event == 'pull_request' ||
+        (github.event.workflow_run.event == 'workflow_dispatch' &&
+         github.event.workflow_run.head_branch != github.event.repository.default_branch)) &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    # with batches, one run at a time per repository (a newer one waits; GitHub keeps the newest waiting), so two wakes
+    # never form two batches nor merge one twice; without, a group of its own, as before
+    concurrency:
+      group: ${{ inputs.batch && format('automerge-batch-{0}', github.repository) || format('automerge-{0}', github.run_id) }}
+      cancel-in-progress: false
+    # bash wherever it runs (a Windows runner's default shell is PowerShell; Git Bash there)
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Merge the pull request CI passed on
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HOLD: ${{ inputs.hold-label }}
+          CI: ${{ inputs.ci-workflow }}
+          DEFAULT: ${{ github.event.repository.default_branch }}
+          METHOD: ${{ inputs.merge-method }}
+          UP_TO_DATE: ${{ inputs.up-to-date }}
+          RETRACT: ${{ inputs.retract-label }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          TESTED_BASE: ${{ github.event.workflow_run.pull_requests[0].base.sha }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          AFTER: ${{ inputs.ci-after-merge }}
+          TRIGGER: ${{ github.event_name }}
+          BATCH: ${{ inputs.batch }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # gh's own --jq only: a self-hosted runner's image need not have jq
+          cat > "$RUNNER_TEMP/closing_keywords.py" <<'PY'
+          # BEGIN closing_keywords.py
+          #!/usr/bin/env python3
+          """closing_keywords - the closing keywords a pull request carries, and the ones that would close an issue by mistake.
+
+              python3 closing_keywords.py check PR.json     # gh pr view --json body,commits: refuse a keyword in a negation or quote
+              python3 closing_keywords.py closes PR.json    # the issues the body's keywords close, one number a line
+              python3 closing_keywords.py --selftest
+
+          GitHub closes the issue a closing keyword names on a merge to the default branch, from the pull request's body or
+          from a commit message, wherever the keyword stands: "This does not close #1132" closed #1132 (spooq/fallingsand#1133),
+          and so did a body describing "a merged PR said it closed: #295". So a keyword is allowed where it says what it means,
+          and refused, with the phrase quoted, where a negation earlier in its sentence or a quote, inline code or a block quote
+          around it says otherwise; the author writes "see #N" there instead. Exit 0: nothing refused. 1: refusals printed.
+          """
+          import json
+          import re
+          import sys
+
+          KEYWORD = re.compile(r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b:?[ \t]+#(\d+)", re.I)
+          NEGATION = re.compile(r"\b(not|never|no|nor|without|instead of|rather than)\b|n't\b", re.I)
+
+
+          def _sentence(text, at):
+              """The text of a match's sentence before it: from the last full stop, question or exclamation mark, or line."""
+              start = max(text.rfind(c, 0, at) for c in ".!?\n")
+              return text[start + 1:at]
+
+
+          def _quoted(text, at):
+              """Whether a match stands inside inline code, a fenced block, a block quote or double quotes."""
+              line_start = text.rfind("\n", 0, at) + 1
+              line = text[line_start:at]
+              fences = len(re.findall(r"^```", text[:at], re.M))
+              return (fences % 2 == 1 or line.lstrip().startswith(">") or line.count("`") % 2 == 1
+                      or (line.count('"') - line.count('\\"')) % 2 == 1 or (line.count("“") > line.count("”")))
+
+
+          def refusals(texts):
+              """Every keyword that would close an issue against the words around it: (where, the phrase, why)."""
+              out = []
+              for where, text in texts:
+                  for m in KEYWORD.finditer(text or ""):
+                      if NEGATION.search(_sentence(text, m.start())):
+                          out.append((where, m.group(0), "a negation earlier in its sentence"))
+                      elif _quoted(text, m.start()):
+                          out.append((where, m.group(0), "it stands inside a quote or code"))
+              return out
+
+
+          def closes(body):
+              return sorted({int(m.group(2)) for m in KEYWORD.finditer(body or "")})
+
+
+          def texts_of(pr):
+              out = [("the body", pr.get("body") or "")]
+              for c in pr.get("commits") or []:
+                  msg = (c.get("messageHeadline") or "") + "\n\n" + (c.get("messageBody") or "")
+                  out.append((f"commit {c.get('oid', '')[:7]}", msg))
+              return out
+
+
+          def selftest():
+              ok = True
+
+              def check(cond, label):
+                  nonlocal ok
+                  print(f"  [{'ok  ' if cond else 'FAIL'}] {label}")
+                  ok = ok and cond
+
+              allowed = ["Closes #40: with saturate and wrap, this finishes ranged stores.", "Fixes #12 and resolves #7.",
+                         "closes: #3", "This is done. Closes #9.", "See #77 for the rest; closes #53."]
+              refused = ["This does not close #1132.", "It doesn't fix #4.", "We will never resolve #5 this way.",
+                         "a merged PR said it \"closed #295\"", "the phrase `closes #8` in code", "> Closes #6 (a quote)",
+                         "```\nfixes #2\n```", "not done: fixes #11"]
+              for t in allowed:
+                  check(not refusals([("t", t)]), f"allowed: {t!r}")
+              for t in refused:
+                  check(bool(refusals([("t", t)])), f"refused: {t!r}")
+              check(closes("Closes #40, fixes #12 and see #41.\nresolved: #7") == [7, 12, 40], "closes: the numbers, not see #N")
+              check(not closes("see #40, refs #41"), "closes: see and refs close nothing")
+              import os, tempfile
+              with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as f:
+                  json.dump({"body": "\u03c1 g, \u221ak, \u00b5m. Closes #5", "commits": []}, f, ensure_ascii=False)
+              try:
+                  check(main(["", "closes", f.name]) == 0, "a body in UTF-8 beyond cp1252 (\u03c1, \u221a) is read")
+              finally:
+                  os.unlink(f.name)
+              print("closing_keywords selftest: " + ("passed" if ok else "failed"))
+              return 0 if ok else 1
+
+
+          def main(argv):
+              if argv[1:] == ["--selftest"]:
+                  return selftest()
+              mode, path = argv[1], argv[2]
+              pr = json.load(open(path, encoding="utf-8"))   # gh writes UTF-8; a Windows runner's default is cp1252
+              if mode == "closes":
+                  print("\n".join(str(n) for n in closes(pr.get("body"))))
+                  return 0
+              bad = refusals(texts_of(pr))
+              for where, phrase, why in bad:
+                  print(f"- {where}: \"{phrase}\" would close the issue, though {why} says otherwise; write \"see #N\" there.")
+              return 1 if bad else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv))
+          # END closing_keywords.py
+          PY
+          # #$1's closing keywords, its body and commits written to $2: refused (said on the pull request) where the words around
+          # one say it should not close the issue
+          keywords() {
+            gh pr view "$1" --repo "$REPO" --json body,commits > "$2" || return 1
+            if ! why=$(python3 "$RUNNER_TEMP/closing_keywords.py" check "$2"); then
+              gh pr comment "$1" --repo "$REPO" --body "Not merged: a closing keyword here would close an issue the words around it say it should not.
+
+            $why
+
+            Edit the body or the commit, then push, or re-run this workflow."
+              echo "$why"; return 1
+            fi
+          }
+          # the merge: #$1 squashed (METHOD) at its head $2, its branch deleted, and each issue its body ($3) closes closed if
+          # GitHub did not, retract-label taken off it
+          land() {
+            gh pr merge "$1" --repo "$REPO" "--$METHOD" --delete-branch --match-head-commit "$2" || return 1
+            for n in $(python3 "$RUNNER_TEMP/closing_keywords.py" closes "$3"); do
+              if [ "$(gh issue view "$n" --repo "$REPO" --json state --jq .state)" = OPEN ]; then
+                gh issue close "$n" --repo "$REPO" --comment "Closed by #$1."
+              fi
+              if [ -n "$RETRACT" ] && gh issue view "$n" --repo "$REPO" --json labels --jq '.labels[].name' | grep -qx "$RETRACT"; then
+                gh issue edit "$n" --repo "$REPO" --remove-label "$RETRACT"
+              fi
+            done
+          }
+          # one pull request at HEAD_SHA on HEAD_BRANCH, CI having passed there (EVENT, TESTED_BASE: that run's)
+          handle() {
+            pr=$(gh pr list --repo "$REPO" --head "$HEAD_BRANCH" --state open --json number,headRefOid,isDraft,labels \
+                 --jq ".[] | select(.headRefOid == \"$HEAD_SHA\")
+                       | [.number, .isDraft, ([.labels[].name] | index(\"$HOLD\") != null)] | @tsv")
+            if [ -z "$pr" ]; then echo "no open pull request at $HEAD_SHA: a newer push, or already merged"; return 0; fi
+            IFS=$'\t' read -r number draft held <<< "$pr"
+            if [ "$draft" = true ]; then echo "#$number is a draft"; return 0; fi
+            if [ "$held" = true ]; then echo "#$number is held"; return 0; fi
+            keywords "$number" "$RUNNER_TEMP/pr.json" || return 1
+            # WHAT MERGES IS WHAT CI PASSED ON. Each job of the passing run names the default branch it merged in by an
+            # artifact (tested-main-<job>-<sha>, spooq/workflows' ci.yml); where every one is the default branch as it
+            # is now, the squash is the tree CI passed on, and it merges. Where the default branch has moved since, CI
+            # is dispatched on the branch again: it merges the default branch in as it then is, and its success brings
+            # this workflow back (its wake job), with nothing pushed to the branch. A run with no such artifacts (an
+            # older CI) is judged by its pull request's base, or by the branch's own distance behind. With batches, such
+            # a pull request is a candidate for one instead (BATCHES).
+            main=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT" --jq .object.sha)
+            tested=""
+            if [ -n "${RUN_ID:-}" ]; then
+              tested=$(gh api "repos/$REPO/actions/runs/$RUN_ID/artifacts" \
+                         --jq '[.artifacts[].name | select(startswith("tested-main-")) | split("-") | last] | unique | join(" ")')
+            fi
+            if [ -n "$tested" ]; then
+              stale=$([ "$tested" != "$main" ] && echo true || echo false)
+            elif [ "$EVENT" = pull_request ] && [ -n "$TESTED_BASE" ]; then
+              stale=$([ "$TESTED_BASE" != "$main" ] && echo true || echo false)
+            else
+              behind=$(gh api "repos/$REPO/compare/$DEFAULT...$HEAD_SHA" --jq .behind_by)
+              stale=$([ "$behind" != 0 ] && echo true || echo false)
+            fi
+            if [ "$UP_TO_DATE" = true ] && [ -n "$CI" ] && [ "$stale" = true ]; then
+              if [ "$BATCH" = true ]; then
+                echo "$DEFAULT is at ${main:0:7}, and CI on #$number tested ${tested:-an older one}: a candidate for a batch"
+                printf '%s\t%s\t%s\n' "$number" "$HEAD_SHA" "$HEAD_BRANCH" >> "$RUNNER_TEMP/stale.tsv"
+                return 0
+              fi
+              echo "$DEFAULT is at ${main:0:7}, and CI on #$number tested ${tested:-an older one}: running CI on it again"
+              gh workflow run "$CI" --repo "$REPO" --ref "$HEAD_BRANCH"
+              return 0
+            fi
+            land "$number" "$HEAD_SHA" "$RUNNER_TEMP/pr.json"
+            if [ -n "$CI" ] && [ "$AFTER" = true ]; then gh workflow run "$CI" --repo "$REPO" --ref "$DEFAULT"; fi
+          }
+          if [ "$TRIGGER" = workflow_run ] && [ "$BATCH" != true ]; then handle; exit $?; fi
+
+          # BATCHES (the header): a batch branch's record is its tip's message
+          tip_of() { gh api "repos/$REPO/git/ref/heads/$1" --jq .object.sha; }
+          # whether #$1 is open at $2, neither a draft nor held
+          member_ok() {
+            [ "$(gh pr view "$1" --repo "$REPO" --json state,headRefOid,isDraft,labels \
+                  --jq "[.state, .headRefOid, .isDraft, ([.labels[].name] | index(\"$HOLD\") != null)] | @tsv")" = "OPEN"$'\t'"$2"$'\t'false$'\t'false ]
+          }
+          drop() { echo "$1: deleted, $2"; gh api -X DELETE "repos/$REPO/git/refs/heads/$1" > /dev/null || true; }
+          # one pull request CI is run on again alone, as without batches: #$1 on its branch $2
+          alone() { echo "#$1 goes round alone: CI dispatched on $2"; gh workflow run "$CI" --repo "$REPO" --ref "$2"; }
+          # a batch named $1 (or $1-2, ... where that exists) of the pull requests in file $3 (number, head, branch a line, in
+          # order) on the default branch as it is, if at least $2 of them merge there; the rest go round alone
+          form() {
+            local name="$1" n=2 main num sha br tip tree rec="" list="" count=0
+            main=$(tip_of "$DEFAULT")
+            while gh api "repos/$REPO/git/ref/heads/$name" > /dev/null 2>&1; do name="$1-$n"; n=$((n + 1)); done
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/heads/$name" -f sha="$main" > /dev/null
+            : > "$RUNNER_TEMP/alone.tsv"
+            while IFS=$'\t' read -r num sha br <&3; do
+              if gh api -X POST "repos/$REPO/merges" -f base="$name" -f head="$sha" \
+                   -f commit_message="automerge batch: merge #$num ($br)" > /dev/null 2> "$RUNNER_TEMP/merge.err"; then
+                rec+="Automerge-Batch-Member: $num $sha $br"$'\n'; list+=" #$num"; count=$((count + 1))
+              else
+                echo "#$num does not merge into $name: $(head -c 300 "$RUNNER_TEMP/merge.err")"
+                printf '%s\t%s\t%s\n' "$num" "$sha" "$br" >> "$RUNNER_TEMP/alone.tsv"
+              fi
+            done 3< "$3"
+            if [ "$count" -lt "$2" ]; then
+              gh api -X DELETE "repos/$REPO/git/refs/heads/$name" > /dev/null || true
+              while read -r num sha br; do printf '%s\t%s\t%s\n' "$num" "$sha" "$br" >> "$RUNNER_TEMP/alone.tsv"; done <<< "${rec//Automerge-Batch-Member: /}"
+            else
+              tip=$(tip_of "$name")
+              tree=$(gh api "repos/$REPO/git/commits/$tip" --jq .tree.sha)
+              tip=$(gh api -X POST "repos/$REPO/git/commits" -f tree="$tree" -f "parents[]=$tip" --jq .sha -f message="automerge batch:$list on $DEFAULT at ${main:0:7}
+
+          Automerge-Batch-Base: $main
+          Automerge-Batch-Tree: $tree
+          $rec")
+              gh api -X PATCH "repos/$REPO/git/refs/heads/$name" -f sha="$tip" > /dev/null
+              echo "$name:$list on $DEFAULT at ${main:0:7}, tree ${tree:0:7}: CI dispatched on it"
+              gh workflow run "$CI" --repo "$REPO" --ref "$name"
+            fi
+            while IFS=$'\t' read -r num sha br <&3; do [ -n "$num" ] && alone "$num" "$br"; done 3< "$RUNNER_TEMP/alone.tsv"
+            return 0
+          }
+          # the merge stopped partway, or left a tree CI did not pass: said loudly, on each member, and the job fails
+          loud() {
+            echo "::error::$1"
+            while IFS=$'\t' read -r num _ _ <&3; do
+              gh pr comment "$num" --repo "$REPO" --body "**The automerge's batch stopped:** $1 See [this run]($RUN_URL); nothing more of the batch merges until someone looks." || true
+            done 3< "$RUNNER_TEMP/members.tsv"
+            exit 1
+          }
+          # every batch branch: merged where its CI passed, split where it failed, abandoned where anything moved
+          settle() {
+            local br tip msg base tree run id status conclusion main tested why num sha mbr i left list n h
+            for br in $(gh api "repos/$REPO/git/matching-refs/heads/automerge/batch-" --jq '.[].ref | ltrimstr("refs/heads/")'); do
+              tip=$(tip_of "$br") || continue
+              msg=$(gh api "repos/$REPO/git/commits/$tip" --jq .message)
+              base=$(printf '%s\n' "$msg" | sed -n 's/^Automerge-Batch-Base: //p')
+              tree=$(printf '%s\n' "$msg" | sed -n 's/^Automerge-Batch-Tree: //p')
+              printf '%s\n' "$msg" | sed -n 's/^Automerge-Batch-Member: //p' | tr ' ' '\t' > "$RUNNER_TEMP/members.tsv"
+              if [ -z "$base" ] || [ -z "$tree" ]; then echo "$br: no batch record at its tip; left alone"; continue; fi
+              list=$(cut -f1 "$RUNNER_TEMP/members.tsv" | sed 's/^/#/' | tr '\n' ' ')
+              main=$(tip_of "$DEFAULT")
+              # the run dispatched on it; where only its wake job is left (the one that brought this run here), it is
+              # seconds from done, and waited for
+              run=""
+              for i in $(seq 1 12); do
+                run=$(gh api "repos/$REPO/actions/workflows/$CI/runs?head_sha=$tip&event=workflow_dispatch&per_page=5" \
+                        --jq '.workflow_runs[0] // empty | [.id, .status, .conclusion // ""] | @tsv')
+                [ -n "$run" ] || break
+                IFS=$'\t' read -r id status conclusion <<< "$run"
+                [ "$status" = completed ] && break
+                left=$(gh api "repos/$REPO/actions/runs/$id/jobs" \
+                         --jq '[.jobs[] | select(.name | test("wake$") | not) | select(.status != "completed")] | length')
+                [ "$left" = 0 ] || break
+                sleep 10
+              done
+              if [ -z "$run" ]; then
+                if [ "$base" != "$main" ]; then drop "$br" "no CI ran on it and $DEFAULT moved"
+                else echo "$br ($list): no CI run at ${tip:0:7}: dispatching it"; gh workflow run "$CI" --repo "$REPO" --ref "$br"; fi
+                continue
+              fi
+              if [ "$status" != completed ]; then echo "$br ($list): CI is $status, left to it"; continue; fi
+              case "$conclusion" in
+                success)
+                  why=""
+                  [ "$base" = "$main" ] || why="$DEFAULT moved to ${main:0:7} since the batch was formed on ${base:0:7}"
+                  tested=$(gh api "repos/$REPO/actions/runs/$id/artifacts" \
+                             --jq '[.artifacts[].name | select(startswith("tested-main-")) | split("-") | last] | unique | join(" ")')
+                  [ -n "$why" ] || [ -z "$tested" ] || [ "$tested" = "$base" ] || why="CI tested $tested, not ${base:0:7}"
+                  if [ -z "$why" ]; then
+                    while IFS=$'\t' read -r num sha mbr <&3; do
+                      member_ok "$num" "$sha" || { why="#$num moved (a push, closed, a draft or held)"; break; }
+                      keywords "$num" "$RUNNER_TEMP/pr-$num.json" || { why="#$num's closing keywords are refused"; break; }
+                    done 3< "$RUNNER_TEMP/members.tsv"
+                  fi
+                  if [ -n "$why" ]; then drop "$br" "$why"; continue; fi
+                  echo "$br: CI passed on $list with $DEFAULT at ${base:0:7}: merging them in order"
+                  while IFS=$'\t' read -r num sha mbr <&3; do
+                    # the default branch has just moved under each after the first: GitHub recomputes the merge first
+                    for i in $(seq 1 6); do
+                      if land "$num" "$sha" "$RUNNER_TEMP/pr-$num.json"; then i=ok; break; fi
+                      [ "$(gh pr view "$num" --repo "$REPO" --json state --jq .state)" = OPEN ] || break
+                      sleep 10
+                    done
+                    [ "$i" = ok ] || loud "#$num of $br did not merge, after the members before it did."
+                    echo "merged #$num"
+                  done 3< "$RUNNER_TEMP/members.tsv"
+                  main=$(tip_of "$DEFAULT")
+                  n=$(gh api "repos/$REPO/git/commits/$main" --jq .tree.sha)
+                  [ "$n" = "$tree" ] || loud "$DEFAULT's tree after merging $list is ${n:0:7}, not ${tree:0:7}, the tree CI passed on $br (kept)."
+                  echo "$DEFAULT at ${main:0:7}: tree ${n:0:7}, the tree CI passed on $br"
+                  gh api -X DELETE "repos/$REPO/git/refs/heads/$br" > /dev/null || true
+                  if [ -n "$CI" ] && [ "$AFTER" = true ]; then gh workflow run "$CI" --repo "$REPO" --ref "$DEFAULT"; fi
+                  ;;
+                failure|timed_out)
+                  drop "$br" "CI ended $conclusion ($GITHUB_SERVER_URL/$REPO/actions/runs/$id)"
+                  : > "$RUNNER_TEMP/split.tsv"
+                  while IFS=$'\t' read -r num sha mbr <&3; do
+                    if member_ok "$num" "$sha"; then printf '%s\t%s\t%s\n' "$num" "$sha" "$mbr" >> "$RUNNER_TEMP/split.tsv"; fi
+                  done 3< "$RUNNER_TEMP/members.tsv"
+                  n=$(wc -l < "$RUNNER_TEMP/members.tsv")
+                  if [ "$n" -le 1 ]; then
+                    if [ -s "$RUNNER_TEMP/split.tsv" ]; then
+                      IFS=$'\t' read -r num sha mbr < "$RUNNER_TEMP/split.tsv"
+                      gh pr comment "$num" --repo "$REPO" --body "**Not merged: a gate failed** on this branch merged with \`$DEFAULT\` (at ${base:0:7}), in a batch of its own. See [this run]($GITHUB_SERVER_URL/$REPO/actions/runs/$id). A new push runs CI again.
+
+          <!-- automerge:batch-failed $sha -->"
+                    fi
+                  else
+                    h=$(( ($(wc -l < "$RUNNER_TEMP/split.tsv") + 1) / 2 ))
+                    head -n "$h" "$RUNNER_TEMP/split.tsv" > "$RUNNER_TEMP/half-a.tsv"
+                    tail -n +"$((h + 1))" "$RUNNER_TEMP/split.tsv" > "$RUNNER_TEMP/half-b.tsv"
+                    echo "$br failed: split in halves"
+                    if [ -s "$RUNNER_TEMP/half-a.tsv" ]; then form "$br-a" 1 "$RUNNER_TEMP/half-a.tsv"; fi
+                    if [ -s "$RUNNER_TEMP/half-b.tsv" ]; then form "$br-b" 1 "$RUNNER_TEMP/half-b.tsv"; fi
+                  fi
+                  ;;
+                *) drop "$br" "CI ended $conclusion" ;;
+              esac
+            done
+          }
+          if [ "$BATCH" = true ]; then
+            settle
+            # the members of the batches still live, left to them
+            : > "$RUNNER_TEMP/live"; : > "$RUNNER_TEMP/stale.tsv"
+            for br in $(gh api "repos/$REPO/git/matching-refs/heads/automerge/batch-" --jq '.[].ref | ltrimstr("refs/heads/")'); do
+              gh api "repos/$REPO/commits/$br" --jq .commit.message | sed -n 's/^Automerge-Batch-Member: \([0-9]*\) .*/\1/p' >> "$RUNNER_TEMP/live"
+            done
+          fi
+          # the sweep: each open pull request from this repository whose head's latest CI run succeeded
+          main=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT" --jq .object.sha)
+          failed=0
+          while IFS=$'	' read -r HEAD_BRANCH HEAD_SHA PR_NUMBER; do
+            [ -n "$HEAD_SHA" ] || continue
+            if [ "$BATCH" = true ]; then
+              if grep -qx "$PR_NUMBER" "$RUNNER_TEMP/live"; then echo "$HEAD_BRANCH: #$PR_NUMBER is in a batch, left to it"; continue; fi
+              if gh pr view "$PR_NUMBER" --repo "$REPO" --json comments --jq '.comments[].body' < /dev/null \
+                   | grep -qF "<!-- automerge:batch-failed $HEAD_SHA -->"; then
+                echo "$HEAD_BRANCH: failed alone in a batch at ${HEAD_SHA:0:7}, waits for a push"; continue
+              fi
+            fi
+            # the latest run that ran: a pull_request run the bot's own update started waits for approval
+            # (action_required, no jobs) and a superseded one is cancelled; neither says anything of the head
+            run=$(gh api "repos/$REPO/actions/workflows/$CI/runs?head_sha=$HEAD_SHA&per_page=20"                   --jq '[.workflow_runs[] | select(.event == "pull_request" or .event == "workflow_dispatch")
+                              | select(.conclusion != "action_required" and .conclusion != "skipped"
+                                       and .conclusion != "cancelled")][0]
+                        | [.status, .conclusion // "", .event, (.pull_requests[0].base.sha // ""), .id] | @tsv')
+            IFS=$'	' read -r status conclusion EVENT TESTED_BASE RUN_ID <<< "$run"
+            if [ -z "$run" ]; then echo "$HEAD_BRANCH: no CI run at ${HEAD_SHA:0:7}"; continue; fi
+            if [ "$status" != completed ]; then echo "$HEAD_BRANCH: CI at ${HEAD_SHA:0:7} is $status, left to it"; continue; fi
+            if [ "$conclusion" != success ]; then echo "$HEAD_BRANCH: CI at ${HEAD_SHA:0:7} ended $conclusion"; continue; fi
+            echo "$HEAD_BRANCH: CI passed at ${HEAD_SHA:0:7} ($EVENT)"
+            handle || failed=1
+          done < <(gh pr list --repo "$REPO" --state open --json headRefName,headRefOid,isCrossRepository,number                      --jq '.[] | select(.isCrossRepository | not) | [.headRefName, .headRefOid, .number] | @tsv')
+          # the candidates, oldest first: two or more a batch, one alone
+          if [ "$BATCH" = true ] && [ -s "$RUNNER_TEMP/stale.tsv" ]; then
+            sort -n -k1,1 -o "$RUNNER_TEMP/stale.tsv" "$RUNNER_TEMP/stale.tsv"
+            if [ "$(wc -l < "$RUNNER_TEMP/stale.tsv")" -ge 2 ]; then
+              main=$(gh api "repos/$REPO/git/ref/heads/$DEFAULT" --jq .object.sha)
+              form "automerge/batch-${main:0:7}" 2 "$RUNNER_TEMP/stale.tsv"
+            else
+              IFS=$'\t' read -r num sha br < "$RUNNER_TEMP/stale.tsv"; alone "$num" "$br"
+            fi
+          fi
+          exit $failed

@@ -1,3 +1,4 @@
+# The shared workflows are copies of spooq/workflows@automerge-batch (shared-*.yml): a public repository cannot call a private one.
 name: CI
 on:
   pull_request:
@@ -7,7 +8,7 @@ on:
   workflow_dispatch:
 jobs:
   ci:
-    uses: spooq/workflows/.github/workflows/ci.yml@automerge-batch
+    uses: ./.github/workflows/shared-ci.yml
     with:
       runner: '"ubuntu-latest"'
       gate-command: python tools/gates.py

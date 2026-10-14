@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 jobs:
   merge:
-    uses: spooq/workflows/.github/workflows/automerge.yml@automerge-batch
+    uses: ./.github/workflows/shared-automerge.yml
     with:
       batch: true
     permissions:
