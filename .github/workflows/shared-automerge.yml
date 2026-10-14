@@ -374,7 +374,7 @@ jobs:
               tree=$(printf '%s\n' "$msg" | sed -n 's/^Automerge-Batch-Tree: //p')
               printf '%s\n' "$msg" | sed -n 's/^Automerge-Batch-Member: //p' | tr ' ' '\t' > "$RUNNER_TEMP/members.tsv"
               if [ -z "$base" ] || [ -z "$tree" ]; then echo "$br: no batch record at its tip; left alone"; continue; fi
-              list=$(cut -f1 "$RUNNER_TEMP/members.tsv" | sed 's/^/#/' | tr '\n' ' ')
+              list=$(cut -f1 "$RUNNER_TEMP/members.tsv" | sed 's/^/#/' | paste -sd ' ')
               main=$(tip_of "$DEFAULT")
               # the run dispatched on it; where only its wake job is left (the one that brought this run here), it is
               # seconds from done, and waited for
