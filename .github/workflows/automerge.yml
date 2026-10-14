@@ -1,0 +1,16 @@
+name: automerge
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  workflow_dispatch:
+jobs:
+  merge:
+    uses: spooq/workflows/.github/workflows/automerge.yml@automerge-batch
+    with:
+      batch: true
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+      issues: write

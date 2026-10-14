@@ -1,0 +1,19 @@
+name: CI
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  workflow_dispatch:
+jobs:
+  ci:
+    uses: spooq/workflows/.github/workflows/ci.yml@automerge-batch
+    with:
+      runner: '"ubuntu-latest"'
+      gate-command: python tools/gates.py
+      browser: false
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: write
+    secrets: inherit
